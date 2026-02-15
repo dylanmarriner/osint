@@ -35,7 +35,7 @@ Design Tradeoffs
 - Review trigger: If WebSocket connection drops below 90%, optimize connection handling
 """
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, BackgroundTasks
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, BackgroundTasks, Depends
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -47,6 +47,7 @@ import logging
 import uuid
 from datetime import datetime
 import structlog
+from sqlalchemy.orm import Session
 
 from ..core.pipeline.discovery import DiscoveryEngine
 from ..core.pipeline.fetch import FetchManager
@@ -56,6 +57,13 @@ from ..core.pipeline.resolve import EntityResolver
 from ..core.pipeline.report import ReportGenerator, ReportFormat
 from ..core.models.entities import InvestigationInput, InvestigationReport
 from ..connectors.base import ConnectorRegistry
+from ..config import get_config
+from ..db import (
+    get_db, init_db, Investigation as DBInvestigation, 
+    InvestigationReport as DBInvestigationReport,
+    get_investigation, save_investigation, save_investigation_report,
+    get_investigation_report, list_investigations, delete_investigation
+)
 
 
 # Configure structured logging
@@ -237,17 +245,19 @@ def initialize_components(connector_registry: ConnectorRegistry):
 active_investigations: Dict[str, InvestigationStatus] = {}
 
 
+config = get_config()
+
 app = FastAPI(
-    title="OSINT Framework",
-    description="Privacy-focused OSINT investigation framework",
-    version="1.0.0"
+    title=config.API_TITLE,
+    description=config.API_DESCRIPTION,
+    version=config.API_VERSION
 )
 
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:8080"],
-    allow_credentials=True,
+    allow_origins=config.CORS_ORIGINS,
+    allow_credentials=config.CORS_ALLOW_CREDENTIALS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -757,6 +767,22 @@ async def create_investigation(request: InvestigationRequest):
         
         active_investigations[investigation_input.investigation_id] = investigation_status
         
+        # Save initial investigation to database
+        db_investigation = DBInvestigation(
+            investigation_id=investigation_input.investigation_id,
+            correlation_id=correlation_id,
+            status="pending",
+            subject_identifiers=investigation_input.subject_identifiers.dict() if hasattr(investigation_input.subject_identifiers, 'dict') else investigation_input.subject_identifiers,
+            investigation_constraints=investigation_input.investigation_constraints,
+            confidence_thresholds=investigation_input.confidence_thresholds,
+            progress_percentage=0.0,
+            current_stage="query_generation",
+            entities_found=0,
+            queries_executed=len(query_plan.queries),
+            errors=[]
+        )
+        save_investigation(db_investigation)
+        
         # Start investigation in background
         asyncio.create_task(run_investigation(investigation_input, query_plan, correlation_id))
         
@@ -857,6 +883,20 @@ async def run_investigation(investigation_input: InvestigationInput, query_plan,
                                                      investigation_input.investigation_id, 
                                                      correlation_id)
         
+        # Save report to database
+        db_report = DBInvestigationReport(
+            report_id=str(uuid.uuid4()),
+            investigation_id=investigation_input.investigation_id,
+            executive_summary=report.executive_summary,
+            identity_inventory=report.identity_inventory,
+            exposure_analysis=report.exposure_analysis,
+            activity_timeline=report.activity_timeline,
+            remediation_recommendations=report.remediation_recommendations,
+            detailed_findings=report.detailed_findings,
+            confidence_score=report.confidence_score if hasattr(report, 'confidence_score') else 0.0
+        )
+        save_investigation_report(db_report)
+        
         # Update status: completed
         await update_investigation_status(
             investigation_input.investigation_id,
@@ -905,6 +945,21 @@ async def update_investigation_status(investigation_id: str, status: str, progre
         active_investigations[investigation_id].progress_percentage = progress
         active_investigations[investigation_id].current_stage = stage
         
+        # Update in database
+        try:
+            investigation = get_investigation(investigation_id)
+            if investigation:
+                investigation.status = status
+                investigation.progress_percentage = progress
+                investigation.current_stage = stage
+                investigation.updated_at = datetime.utcnow()
+                save_investigation(investigation)
+        except Exception as e:
+            logger.error("Failed to update investigation in database", {
+                "investigation_id": investigation_id,
+                "error": str(e)
+            })
+        
         status_message = WebSocketMessage(
             type="status_update",
             data=active_investigations[investigation_id].to_dict(),
@@ -935,66 +990,95 @@ async def websocket_endpoint(websocket: WebSocket, investigation_id: str):
 
 
 @app.get("/api/investigations/{investigation_id}/status", response_model=InvestigationStatus)
-async def get_investigation_status(investigation_id: str):
+async def get_investigation_status(investigation_id: str, db: Session = Depends(get_db)):
     """Get current investigation status."""
+    # Check active investigations first (in-memory for real-time)
     if investigation_id in active_investigations:
         return active_investigations[investigation_id]
-    else:
+    
+    # Fall back to database for historical investigations
+    investigation = get_investigation(investigation_id, db)
+    if not investigation:
         raise HTTPException(status_code=404, detail="Investigation not found")
+    
+    return InvestigationStatus(
+        investigation_id=investigation.investigation_id,
+        status=investigation.status,
+        progress_percentage=investigation.progress_percentage,
+        current_stage=investigation.current_stage,
+        entities_found=investigation.entities_found,
+        queries_executed=investigation.queries_executed,
+        errors=investigation.errors or [],
+        started_at=investigation.started_at,
+        estimated_completion=investigation.estimated_completion,
+        correlation_id=investigation.correlation_id
+    )
+
+
+@app.get("/api/investigations")
+async def list_investigations_endpoint(limit: int = 50, offset: int = 0, db: Session = Depends(get_db)):
+    """List all investigations."""
+    investigations = list_investigations(limit=limit, offset=offset, db=db)
+    return {
+        "count": len(investigations),
+        "limit": limit,
+        "offset": offset,
+        "investigations": [inv.to_dict() for inv in investigations]
+    }
 
 
 @app.get("/api/investigations/{investigation_id}/report")
-async def get_investigation_report(investigation_id: str, format: str = "json"):
+async def get_investigation_report_endpoint(investigation_id: str, format: str = "json", db: Session = Depends(get_db)):
     """Get investigation report in specified format."""
-    logger = structlog.get_logger("report_endpoint").bind(
+    request_logger = structlog.get_logger("report_endpoint").bind(
         investigation_id=investigation_id,
         format=format
     )
     
     try:
-        # Get the completed report (in a real implementation, this would be stored)
-        if investigation_id not in active_investigations:
+        # Get investigation from database
+        investigation = get_investigation(investigation_id, db)
+        if not investigation:
             raise HTTPException(status_code=404, detail="Investigation not found")
         
-        investigation_status = active_investigations[investigation_id]
-        if investigation_status.status != "completed":
+        if investigation.status != "completed":
             raise HTTPException(status_code=400, detail="Investigation not completed")
         
-        # For demo purposes, create a sample report
-        sample_report = InvestigationReport(
-            investigation_id=investigation_id,
-            executive_summary=report_generator.executive_summary,
-            identity_inventory={},
-            exposure_analysis={},
-            activity_timeline=[],
-            remediation_recommendations=[],
-            detailed_findings=[]
+        # Get report from database
+        db_report = get_investigation_report(investigation_id, db)
+        if not db_report:
+            raise HTTPException(status_code=404, detail="Report not found")
+        
+        # Construct InvestigationReport from database record
+        report = InvestigationReport(
+            investigation_id=db_report.investigation_id,
+            executive_summary=db_report.executive_summary,
+            identity_inventory=db_report.identity_inventory or {},
+            exposure_analysis=db_report.exposure_analysis or {},
+            activity_timeline=db_report.activity_timeline or [],
+            remediation_recommendations=db_report.remediation_recommendations or [],
+            detailed_findings=db_report.detailed_findings or []
         )
         
-        logger.info("Report requested", {
-            "investigation_id": investigation_id,
-            "format": format
-        })
+        request_logger.info("Report requested")
         
         if format.lower() == "json":
-            report_content = await report_generator.export_report(sample_report, ReportFormat.JSON)
+            report_content = await report_generator.export_report(report, ReportFormat.JSON)
             return JSONResponse(content=report_content, media_type="application/json")
         elif format.lower() == "markdown":
-            report_content = await report_generator.export_report(sample_report, ReportFormat.MARKDOWN)
+            report_content = await report_generator.export_report(report, ReportFormat.MARKDOWN)
             return JSONResponse(content=report_content, media_type="text/markdown")
         elif format.lower() == "html":
-            report_content = await report_generator.export_report(sample_report, ReportFormat.HTML)
+            report_content = await report_generator.export_report(report, ReportFormat.HTML)
             return JSONResponse(content=report_content, media_type="text/html")
         else:
             raise HTTPException(status_code=400, detail=f"Unsupported format: {format}")
             
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error("Failed to generate report", {
-            "investigation_id": investigation_id,
-            "format": format,
-            "error": str(e)
-        })
-        raise HTTPException(status_code=500, detail=str(e))
+        request_logger.error("Failed to get report", error=str(e))
+        raise HTTPException(status_code=500, detail="Failed to retrieve report")
 
 
 @app.get("/api/health")
@@ -1047,6 +1131,31 @@ async def health_check():
         )
 
 
+@app.on_event("startup")
+async def startup_event():
+    """Initialize database and components on startup."""
+    logger.info("OSINT Framework API starting up")
+    try:
+        init_db()
+        logger.info("Database initialized successfully")
+    except Exception as e:
+        logger.error("Failed to initialize database", error=str(e))
+        raise
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup resources on shutdown."""
+    logger.info("OSINT Framework API shutting down")
+    # Cleanup WebSocket connections
+    if connection_manager:
+        for connection_id, websocket in connection_manager.active_connections.items():
+            try:
+                await websocket.close()
+            except Exception:
+                pass
+
+
 if __name__ == "__main__":
     import uvicorn
     
@@ -1055,8 +1164,8 @@ if __name__ == "__main__":
     
     uvicorn.run(
         app,
-        host="0.0.0.0",
-        port=8000,
-        log_level="info",
+        host=config.SERVER_HOST,
+        port=config.SERVER_PORT,
+        log_level=config.LOG_LEVEL.lower(),
         access_log=True
     )

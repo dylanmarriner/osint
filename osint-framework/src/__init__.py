@@ -114,7 +114,8 @@ def get_connector_registry() -> ConnectorRegistry:
     """Get or create connector registry instance."""
     global _connector_registry
     if _connector_registry is None:
-        _connector_registry = ConnectorRegistry()
+        from .connectors.manager import get_initialized_registry
+        _connector_registry = get_initialized_registry()
     return _connector_registry
 
 

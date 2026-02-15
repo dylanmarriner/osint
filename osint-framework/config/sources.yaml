@@ -1,0 +1,127 @@
+# OSINT Framework Configuration
+# All data sources are free — no API keys required
+
+sources:
+  # === Local Recon Modules (Direct Protocol Queries) ===
+  dns_recon:
+    enabled: true
+    resolvers:
+      - "8.8.8.8"       # Google Public DNS
+      - "1.1.1.1"       # Cloudflare DNS
+      - "9.9.9.9"       # Quad9 DNS
+    timeout: 5.0
+    subdomain_scan: true
+    wordlist: "built-in"  # Uses built-in top-500 subdomain list
+
+  whois_recon:
+    enabled: true
+    timeout: 10.0
+
+  port_scanner:
+    enabled: true
+    timeout: 3.0
+    max_concurrent: 100
+    quick_scan_ports: 20  # Top 20 ports for quick scan
+    full_scan_ports: 100  # Top 100 ports for full scan
+
+  cert_transparency:
+    enabled: true
+    provider: "crt.sh"  # Public CT log aggregator, no key needed
+    timeout: 30.0
+
+  web_scraper:
+    enabled: true
+    timeout: 15.0
+    max_redirects: 5
+    user_agent: "OSINT-Framework/2.0"
+
+  username_checker:
+    enabled: true
+    timeout: 10.0
+    max_concurrent: 20
+    platforms: "all"  # Check all 50+ platforms
+
+  email_harvester:
+    enabled: true
+    timeout: 10.0
+    max_pages: 20
+    max_depth: 2
+
+  # === Free APIs (No Key Required) ===
+  ip_api:
+    enabled: true
+    url: "http://ip-api.com/json/"
+    rate_limit: 45  # requests per minute (free tier limit)
+    note: "Free IP geolocation, no API key needed"
+
+  crt_sh:
+    enabled: true
+    url: "https://crt.sh/"
+    rate_limit: 0  # No documented rate limit
+    note: "Public certificate transparency search"
+
+  wayback_machine:
+    enabled: true
+    url: "https://web.archive.org/cdx/search/cdx"
+    rate_limit: 15  # Be polite
+    note: "Internet Archive CDX API, public access"
+
+  hibp_passwords:
+    enabled: true
+    url: "https://api.pwnedpasswords.com/range/"
+    rate_limit: 0  # K-anonymity API, no key needed
+    note: "HaveIBeenPwned password check via k-anonymity"
+
+  github_api:
+    enabled: true
+    url: "https://api.github.com/"
+    rate_limit: 60  # Per hour, unauthenticated
+    note: "GitHub public API, 60 req/hr without auth"
+
+rate_limits:
+  global:
+    max_concurrent_requests: 50
+    request_delay_ms: 100
+  per_source:
+    ip_api: { rpm: 45, burst: 5 }
+    crt_sh: { rpm: 30, burst: 3 }
+    wayback: { rpm: 15, burst: 2 }
+    github: { rph: 60, burst: 10 }
+    username_check: { rpm: 120, burst: 20 }
+
+scoring_weights:
+  # Risk scoring weights (0.0 - 1.0)
+  open_ports:
+    weight: 0.20
+    thresholds:
+      low: 5
+      medium: 10
+      high: 20
+  security_headers:
+    weight: 0.20
+    thresholds:
+      good: 85
+      fair: 50
+      poor: 30
+  email_security:
+    weight: 0.15
+    checks:
+      - spf
+      - dmarc
+      - dkim
+  exposed_data:
+    weight: 0.15
+    includes:
+      - emails
+      - phone_numbers
+      - social_profiles
+  attack_surface:
+    weight: 0.15
+    factors:
+      - subdomain_count
+      - technology_stack_age
+  breach_exposure:
+    weight: 0.15
+    factors:
+      - breach_count
+      - breach_severity

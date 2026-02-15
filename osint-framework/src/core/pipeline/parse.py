@@ -327,8 +327,8 @@ class BaseParser:
                             current_content = decoded
                             decoded_attempts += 1
                             continue
-                    except:
-                        pass
+                    except Exception as e:
+                        self.logger.debug(f"URL decode failed: {e}")
                 
                 # Try base64
                 import base64
@@ -338,15 +338,15 @@ class BaseParser:
                         current_content = decoded
                         decoded_attempts += 1
                         continue
-                except:
-                    pass
+                except Exception as e:
+                    self.logger.debug(f"Base64 decode failed: {e}")
                 
                 break
             
             if decoded_attempts >= 5:
                 raise SecurityError("Excessive content encoding detected")
-        except:
-            pass  # If decoding fails, continue with original content
+        except Exception as e:
+            self.logger.warning(f"Content decoding failed, continuing with original: {e}")
 
     def _detect_content_type(self, content: str) -> ContentType:
         """Detect the actual content type."""
@@ -357,21 +357,22 @@ class BaseParser:
             try:
                 json.loads(content_stripped)
                 return ContentType.JSON
-            except:
-                pass
+            except Exception as e:
+                self.logger.debug(f"JSON parse failed: {e}")
         
         # Check for XML
         if content_stripped.startswith('<') and content_stripped.endswith('>'):
             try:
                 lxml.html.fromstring(content_stripped)
                 return ContentType.HTML
-            except:
+            except Exception as e:
+                self.logger.debug(f"HTML parse failed: {e}")
                 try:
                     import xml.etree.ElementTree as ET
                     ET.fromstring(content_stripped)
                     return ContentType.XML
-                except:
-                    pass
+                except Exception as e:
+                    self.logger.debug(f"XML parse failed: {e}")
         
         # Default to text
         return ContentType.TEXT
@@ -631,8 +632,8 @@ class HTMLParser(BaseParser):
                 elif 'c/' in url:
                     return path_parts[path_parts.index('c') + 1] if 'c' in path_parts else None
         
-        except Exception:
-            pass
+        except Exception as e:
+            self.logger.debug(f"Failed to extract username from URL {url}: {e}")
         
         return None
 
@@ -645,8 +646,8 @@ class HTMLParser(BaseParser):
                 if len(parent_text) > 200:
                     parent_text = parent_text[:200] + "..."
                 return parent_text
-        except:
-            pass
+        except Exception as e:
+            self.logger.debug(f"Failed to get element context: {e}")
         return ""
 
 
@@ -799,12 +800,18 @@ class TextParser(BaseParser):
 
 class SecurityError(Exception):
     """Security validation error."""
-    pass
+    def __init__(self, message: str, content: str = ""):
+        self.message = message
+        self.content = content
+        super().__init__(f"Security validation error: {message}")
 
 
 class ValidationError(Exception):
     """Validation error."""
-    pass
+    def __init__(self, message: str, field: str = ""):
+        self.message = message
+        self.field = field
+        super().__init__(f"Validation error in {field}: {message}" if field else f"Validation error: {message}")
 
 
 class ParseEngine:
@@ -1000,7 +1007,7 @@ class ParseEngine:
             try:
                 json.loads(content_stripped)
                 return ContentType.JSON
-            except:
+            except (json.JSONDecodeError, ValueError):
                 pass
         
         # Check for XML/HTML
@@ -1008,12 +1015,12 @@ class ParseEngine:
             try:
                 lxml.html.fromstring(content_stripped)
                 return ContentType.HTML
-            except:
+            except Exception:
                 try:
                     import xml.etree.ElementTree as ET
                     ET.fromstring(content_stripped)
                     return ContentType.XML
-                except:
+                except Exception:
                     pass
         
         # Default to text
